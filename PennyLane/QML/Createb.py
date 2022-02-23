@@ -14,6 +14,7 @@ def pre_circuit():
     circuit.append(cirq.X(a))
     circuit.append(cirq.ry(np.pi * 0.6).on(b).controlled_by(a))
     circuit.append(cirq.X(a))
+    return [a, b]
 
 
 pre_circuit()
@@ -31,6 +32,8 @@ circuit2 = cirq.Circuit()
 def a_pre_circuit():
     circuit2.append(cirq.H(d))
     circuit2.append(cirq.H(e))
+    circuit2.append(cirq.X(d))
+    circuit2.append(cirq.X(e))
     circuit2.append(cirq.ry(2 * np.arcsin(0.42)).on(c).controlled_by(d, e))
     circuit2.append(cirq.X(e))
     circuit2.append(cirq.ry(2 * np.arcsin(0.57)).on(c).controlled_by(d, e))
