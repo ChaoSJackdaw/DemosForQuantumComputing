@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 
 import qiskit
 from qiskit import assemble, transpile
+from qiskit import ClassicalRegister
 
 import torch
 from torch.autograd import Function
@@ -13,8 +14,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # 旋转门初始化参数，backward是静态函数，暂时定义为全局变量
-global arg
-arg = random.random() * np.pi - np.pi / 2
+args = []
+for i in range(2):
+    args.append(random.random() * np.pi - np.pi / 2)
+
+label: int
+global pre_out
 
 
 class QuantumCircuit:
@@ -26,35 +31,38 @@ class QuantumCircuit:
         # --- Circuit definition ---
         self.circuit = qiskit.QuantumCircuit(n_qubits)
         all_qubits = [i for i in range(n_qubits)]
-        self.theta = qiskit.circuit.Parameter('theta')
-        self.gamma = qiskit.circuit.Parameter('gamma')
-        # self.circuit.h(all_qubits[0])
-        self.circuit.barrier()
+        self.theta0 = qiskit.circuit.Parameter('theta0')
+        self.theta1 = qiskit.circuit.Parameter('theta1')
+        self.gamma0 = qiskit.circuit.Parameter('gamma0')
+        self.gamma1 = qiskit.circuit.Parameter('gamma1')
         self.circuit.h(all_qubits[0])
-        self.circuit.ry(self.theta, all_qubits[0])
-        self.circuit.rx(self.gamma, all_qubits[0])
-        self.circuit.cx(all_qubits[0], all_qubits[1])
-        cbit = self.circuit._create_creg(1, "meas")
-        self.circuit.add_register(cbit)
-        self.circuit.measure(all_qubits[1], cbit)
+        self.circuit.barrier()
+        self.circuit.ry(self.theta0, all_qubits[0])
+        self.circuit.ry(self.theta1, all_qubits[1])
+        self.circuit.rx(self.gamma0, all_qubits[0])
+        self.circuit.rx(self.gamma1, all_qubits[1])
+        self.circuit.save_statevector()
         # ---------------------------
         self.backend = backend
         self.shots = shots
 
-    def run(self, thetas, gamma):
+    def run(self, thetas):
         t_qc = transpile(self.circuit, self.backend)
+        arg1 = thetas[0] ** 2 / (thetas[0] ** 2 + thetas[1] ** 2)
+        arg2 = thetas[2] ** 2 / (thetas[2] ** 2 + thetas[3] ** 2)
+        binds_list = [{self.theta0: arg1, self.theta1: arg2, self.gamma0: args[0], self.gamma1: args[1]}]
         # theta bind to thetas
-        qobj = assemble(t_qc, shots=self.shots,
-                        parameter_binds=[{self.gamma: gamma, self.theta: thetas[0]}])
+        qobj = assemble(t_qc, shots=self.shots, parameter_binds=binds_list)
         # run quantum circuit
         job = self.backend.run(qobj)
         result = job.result().get_counts()
-        counts = np.array(list(result.values()))
-        state = np.array(list(result.keys())).astype(float)
-        # Compute probabilities for each state
-        probabilities = counts / self.shots
-        # Get state expectation
-        expectation = np.sum(state * probabilities)
+        result_0 = result['00']
+        result_1 = result['01']
+        result_2 = result['10']
+        result_3 = result['11']
+
+        expectation = [result_0, result_1, result_2, result_3]
+
         return np.array([expectation])
 
 
@@ -65,7 +73,7 @@ class HybridFunction(Function):
         """ Forward pass computation """
         ctx.shift = shift
         ctx.quantum_circuit = quantum_circuit
-        expectation_z = ctx.quantum_circuit.run(input[0].tolist(), arg)
+        expectation_z = ctx.quantum_circuit.run(input[0].tolist())
         result = torch.tensor([expectation_z])
         ctx.save_for_backward(input, result)
         return result
@@ -75,29 +83,37 @@ class HybridFunction(Function):
         """ Backward pass computation """
         input, expectation_z = ctx.saved_tensors
         input_list = np.array(input.tolist())
-        global arg
-        arg_list = np.array([[arg]])
         """ parameter shift rule """
-        gamma_right = arg_list + np.ones(input_list.shape) * ctx.shift
-        gamma_left = arg_list - np.ones(input_list.shape) * ctx.shift
         theta_right = input_list + np.ones(input_list.shape) * ctx.shift
         theta_left = input_list - np.ones(input_list.shape) * ctx.shift
         gradients = []
+        threshold = 0.002
+        pre_result = pre_out[0][label].item()
+        res = 1.0
+        while res >= threshold:
+            for i in range(len(args)):
+                args[i] = args[i] + ctx.shift
+                expectation_right = ctx.quantum_circuit.run(input_list[0])
+                args[i] = args[i] - 2 * ctx.shift
+                expectation_left = ctx.quantum_circuit.run(input_list[0])
+                args[i] += ctx.shift + 0.01 * (expectation_right[0][label] - expectation_left[0][label])
+                args[i] %= 2 * np.pi
+
+            current_res = ctx.quantum_circuit.run(input_list[0])
+            current_res = current_res[0][label]
+            res = current_res - pre_result
+            pre_result = current_res
+
         for i in range(len(input_list)):
-            # 计算gamma梯度，更新后计算theta
-            expectation_gamma_right = ctx.quantum_circuit.run(input_list[i], gamma_left[i][i])
-            expectation_gamma_left = ctx.quantum_circuit.run(input_list[i], gamma_right[i][i])
-            grad_for_arg = expectation_gamma_right - expectation_gamma_left
             # 更新gamma值
-            arg = (arg + grad_for_arg[0] * 0.001) % (2 * np.pi)
-            expectation_right = ctx.quantum_circuit.run(theta_right[i], arg_list[i][i])
-            expectation_left = ctx.quantum_circuit.run(theta_left[i], arg_list[i][i])
-            expectation = expectation_right - expectation_left + grad_for_arg[0]
+            expectation_right = ctx.quantum_circuit.run(theta_right[i])
+            expectation_left = ctx.quantum_circuit.run(theta_left[i])
             # Quantum circuit learning 中有介绍梯度计算
-            gradient = torch.tensor([expectation])
+            gradient = torch.tensor([expectation_right]) - torch.tensor([expectation_left])
             gradients.append(gradient)
 
-        gradients = np.array([gradients]).T
+        # gradients = np.array([gradients]).T
+        gradients = np.array([item.detach().numpy() for item in gradients])
         return torch.tensor([gradients]).float() * grad_output.float(), None, None
 
 
@@ -119,28 +135,34 @@ class Hybrid(nn.Module):
         return HybridFunction.apply(input, self.quantum_circuit, self.shift)
 
 
-# Concentrating on the first 100 samples
+# 训练集
 n_samples = 100
-
 X_train = datasets.MNIST(root='./data', train=True, download=True, transform=transforms.Compose([transforms.ToTensor()]))
+temp = np.where(X_train.targets == 2)[0][:n_samples]
+idx = np.append(np.where(X_train.targets == 0)[0][:n_samples],
+                np.append(np.where(X_train.targets == 1)[0][:n_samples],
+                          np.append(np.where(X_train.targets == 2)[0][:n_samples],
+                                    np.where(X_train.targets == 3)[0][:n_samples]
+                                    )
+                          )
+                )
 
-# 保留MNIST数据集中0和1的数据
-idx = np.append(np.where(X_train.targets == 0)[0][:n_samples], np.where(X_train.targets == 1)[0][:n_samples])
-
-# 将0,1数据集覆盖原本的MNIST数据集
 X_train.data = X_train.data[idx]
 X_train.targets = X_train.targets[idx]
 
+# 测试集
 n_samples = 50
+X_test = datasets.MNIST(root='./data', train=False, download=True, transform=transforms.Compose([transforms.ToTensor()]))
+idx = np.append(np.where(X_train.targets == 0)[0][:n_samples],
+                np.append(np.where(X_train.targets == 1)[0][:n_samples],
+                          np.append(np.where(X_train.targets == 2)[0][:n_samples],
+                                    np.where(X_train.targets == 3)[0][:n_samples]
+                                    )
+                          )
+                )
 
-X_test = datasets.MNIST(root='./data', train=False, download=True,
-                        transform=transforms.Compose([transforms.ToTensor()]))
-
-idx = np.append(np.where(X_test.targets == 0)[0][:n_samples],
-                np.where(X_test.targets == 1)[0][:n_samples])
-
-X_test.data = X_test.data[idx]
-X_test.targets = X_test.targets[idx]
+X_test.data = X_train.data[idx]
+X_test.targets = X_train.targets[idx]
 
 train_loader = torch.utils.data.DataLoader(X_train, batch_size=1, shuffle=True)
 test_loader = torch.utils.data.DataLoader(X_test, batch_size=1, shuffle=True)
@@ -162,7 +184,7 @@ class Net(nn.Module):
         )
         self.dropout = nn.Dropout2d()
         self.fc1 = nn.Linear(256, 64)
-        self.fc2 = nn.Linear(64, 1)
+        self.fc2 = nn.Linear(64, 4)
         """
             Hybird(self, backend, shots, shift)
             backend -> qiskit.Aer.get_backend('aer_simulator')
@@ -178,15 +200,16 @@ class Net(nn.Module):
         x = self.conv2(x)
         x = F.max_pool2d(x, 2)
         x = self.dropout(x)
+        # 将二维数据变为一维
         x = x.view(1, -1)
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
         x = self.hybrid(x)
-        return torch.cat((x, 1-x), -1)
+        return x[0]
 
 
 model = Net()
-optimizer = optim.Adam(model.parameters(), lr=0.005)
+optimizer = optim.Adam(model.parameters(), lr=0.002)
 loss_func = nn.NLLLoss()
 
 epoch = 0
@@ -194,15 +217,17 @@ loss_list2 = [0]
 x = []
 model.train()
 total_loss = []
-while epoch <= 50:
+while epoch <= 200:
     epoch += 1
     x.append(epoch)
     for batch_idx, (data, target) in enumerate(train_loader):
         optimizer.zero_grad()
         # Forward pass
         output = model(data)
+        pre_out = output
         # Calculating loss
         loss = loss_func(output, target)
+        label = target.item()
         # Backward pass
         loss.backward()
         # Optimize the weights
